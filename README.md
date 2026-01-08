@@ -13,7 +13,7 @@ This repository contains the code for the paper "Style-constrained inverse desig
 ## Usage
 
 ### Prerequisites
-The finite element analysis code is implemented via [JAX-FEM](https://github.com/deepmodeling/jax-fem). Please first follow the [installation instructions](https://deepmodeling.github.io/jax-fem/guide/Installation.html) to install `jax_fem` in a conda environment. All the subsequent procedures should be run in the conda environment with JAX-FEM installed.
+The finite element analysis code is implemented via [JAX-FEM](https://github.com/deepmodeling/jax-fem). Please first follow the [installation instructions](https://deepmodeling.github.io/jax-fem/guide/Installation.html) to install `jax_fem` in a conda environment. All the subsequent procedures should be run in the conda environment with `jax_fem` installed.
 
 ### Install dependencies
 Some basic dependencies are installed when installing `jax_fem`. Additional dependencies include `flax`, `optax`, `tensorflow`, `tensorflow-datasets`, and `tqdm`. You can follow the official installation instructions to install them or just run:
