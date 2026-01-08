@@ -1,0 +1,5 @@
+tensorflow==2.19.0
+tensorflow-datasets==4.9.9
+flax==0.10.7
+optax==0.2.5
+tqdm==4.67.1
