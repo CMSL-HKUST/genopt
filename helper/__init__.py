@@ -1,1 +1,25 @@
-"""Initialization"""import jax# logger managerfrom .utils import LoggerManager__all__ = ["logger"]# LOGGERlogger = LoggerManager(package_name='gen_opt', level='INFO', output='c', mode='w')# PLATFORMdevice = jax.devices()[0]if device.platform == "cpu":    logger.info("Hardware: CPU (no GPU detected)")else:    logger.info(f"Hardware: GPU ({device.device_kind})")    if jax.local_device_count() > 1:        logger.info("Multiple devices detected - enforcing single-device mode")
+"""
+
+Initialization
+
+"""
+
+import jax
+
+# logger manager
+from .utils import LoggerManager
+
+__all__ = ["logger"]
+
+# LOGGER
+logger = LoggerManager(package_name='gen_opt', level='INFO', output='c', mode='w')
+
+
+# PLATFORM
+device = jax.devices()[0]
+if device.platform == "cpu":
+    logger.info("Hardware: CPU (no GPU detected)")
+else:
+    logger.info(f"Hardware: GPU ({device.device_kind})")
+    if jax.local_device_count() > 1:
+        logger.info("Multiple devices detected - enforcing single-device mode")

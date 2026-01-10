@@ -1,1 +1,144 @@
-from typing import Callable, Optional, Tuple, Anyimport jax.numpy as npimport optaximport numpy as onpfrom .base import Backendfrom ..core.optimizer import Optimizerfrom ..core.result import OptimizationResult@Optimizer.register_backend('optax')class OptaxBackend(Backend):    """Optax backend (Adam only)."""        def minimize(        self,        objective: Callable[[onp.ndarray], float],        x0: onp.ndarray,        tol: Optional[float] = None,        bounds: Optional[Tuple[Tuple[float, float], ...]] = None,        constraints: Optional[list] = None,        options: Optional[dict] = None,        user_callback: Optional[Callable[..., Any]] = None    ) -> OptimizationResult:        """Minimize using Adam optimizer for traditional inverse problems."""                assert self.method == 'Adam', "Optax backend only supports 'Adam'"        assert len(x0.shape) == 1, f"Expected shape (n,) for x0, got {x0.shape}"                # Parse options        opts = options or {}        learning_rate = opts.get('learning_rate', 1e-3)        max_iter = opts.get('max_iter', 1000)        patience = opts.get('patience', 20)                # Create Adam optimizer        optimizer = optax.adam(learning_rate=learning_rate)                # Prepare objective function with gradient        objective_with_grad = self.create_value_and_grad(objective)                # Initialize state        x = np.array(x0.copy())        opt_state = optimizer.init(x)                # Initialize result tracking        initial_val, _ = objective_with_grad(x0)        initial_fun = float(initial_val)                result = self._create_result(            x=x0.copy(),            fun=initial_fun,            success=False,            message='Optimization started',            nfev=0,            njev=0,            nit=0,            history={'xs': [x0.copy()], 'funs': [initial_fun], 'grad_norms': []}        )                self.logger.info(f"Initial objective: {initial_fun:.6e}")                # Optimization loop        best_x = x0.copy()        best_fun = initial_fun        patience_counter = 0                for iteration in range(max_iter):            # Compute gradient and function value            fun_val, grads = objective_with_grad(x)            current_fun = float(fun_val)            grad_norm = float(np.linalg.norm(grads))                        # Update parameters            updates, opt_state = optimizer.update(grads, opt_state, x)            x = optax.apply_updates(x, updates)                        # Update result tracking            result.nit = iteration + 1            result.nfev = objective_with_grad.calls            result.njev = objective_with_grad.calls                        current_x = onp.array(x)            result.history['xs'].append(current_x.copy())            result.history['funs'].append(current_fun)            result.history['grad_norms'].append(grad_norm)                        # Update best result            if current_fun < best_fun:                best_fun = current_fun                best_x = current_x.copy()                patience_counter = 0            else:                patience_counter += 1                        self.logger.info(f"Iter {result.nit:03d} Obj: {current_fun:.6e} GradNorm: {grad_norm:.6e}")                        # Custom stopping condition            if tol is not None and current_fun < tol:                result.x = current_x                result.fun = current_fun                result.success = True                result.message = f"Objective < tolerance ({current_fun:.2e} < {tol:.2e})"                self.logger.info(f"Custom convergence achieved: {current_fun:.2e} < {tol:.2e}")                break                        # Gradient convergence check            if grad_norm < 1e-8:  # Gradient is sufficiently small                result.x = current_x                result.fun = current_fun                result.success = True                result.message = f"Gradient converged (norm: {grad_norm:.2e})"                self.logger.info(f"Gradient convergence achieved: {grad_norm:.2e}")                break                        # Early stopping condition            if patience_counter >= patience:                result.x = best_x                result.fun = best_fun                result.success = True                result.message = f"No improvement for {patience} iterations"                self.logger.info(f"Early stopping at iteration {iteration}")                break                        # User callback            if user_callback:                user_callback(result, current_x, current_fun)                else:            # Reached maximum iterations            result.x = best_x            result.fun = best_fun            result.success = False            result.message = f"Maximum iterations reached ({max_iter})"            self.logger.warning("Maximum iterations reached without convergence")                # Set final result        if result.success:            self.logger.info(f"Optimization completed successfully: {result.message}")        else:            self.logger.warning(f"Optimization did not converge: {result.message}")                return result
+from typing import Callable, Optional, Tuple, Any
+
+import jax.numpy as np
+
+import optax
+import numpy as onp
+
+from .base import Backend
+from ..core.optimizer import Optimizer
+from ..core.result import OptimizationResult
+
+@Optimizer.register_backend('optax')
+class OptaxBackend(Backend):
+    """Optax backend (Adam only)."""
+    
+    def minimize(
+        self,
+        objective: Callable[[onp.ndarray], float],
+        x0: onp.ndarray,
+        tol: Optional[float] = None,
+        bounds: Optional[Tuple[Tuple[float, float], ...]] = None,
+        constraints: Optional[list] = None,
+        options: Optional[dict] = None,
+        user_callback: Optional[Callable[..., Any]] = None
+    ) -> OptimizationResult:
+        """Minimize using Adam optimizer for traditional inverse problems."""
+        
+        assert self.method == 'Adam', "Optax backend only supports 'Adam'"
+        assert len(x0.shape) == 1, f"Expected shape (n,) for x0, got {x0.shape}"
+        
+        # Parse options
+        opts = options or {}
+        learning_rate = opts.get('learning_rate', 1e-3)
+        max_iter = opts.get('max_iter', 1000)
+        patience = opts.get('patience', 20)
+        
+        # Create Adam optimizer
+        optimizer = optax.adam(learning_rate=learning_rate)
+        
+        # Prepare objective function with gradient
+        objective_with_grad = self.create_value_and_grad(objective)
+        
+        # Initialize state
+        x = np.array(x0.copy())
+        opt_state = optimizer.init(x)
+        
+        # Initialize result tracking
+        initial_val, _ = objective_with_grad(x0)
+        initial_fun = float(initial_val)
+        
+        result = self._create_result(
+            x=x0.copy(),
+            fun=initial_fun,
+            success=False,
+            message='Optimization started',
+            nfev=0,
+            njev=0,
+            nit=0,
+            history={'xs': [x0.copy()], 'funs': [initial_fun], 'grad_norms': []}
+        )
+        
+        self.logger.info(f"Initial objective: {initial_fun:.6e}")
+        
+        # Optimization loop
+        best_x = x0.copy()
+        best_fun = initial_fun
+        patience_counter = 0
+        
+        for iteration in range(max_iter):
+            # Compute gradient and function value
+            fun_val, grads = objective_with_grad(x)
+            current_fun = float(fun_val)
+            grad_norm = float(np.linalg.norm(grads))
+            
+            # Update parameters
+            updates, opt_state = optimizer.update(grads, opt_state, x)
+            x = optax.apply_updates(x, updates)
+            
+            # Update result tracking
+            result.nit = iteration + 1
+            result.nfev = objective_with_grad.calls
+            result.njev = objective_with_grad.calls
+            
+            current_x = onp.array(x)
+            result.history['xs'].append(current_x.copy())
+            result.history['funs'].append(current_fun)
+            result.history['grad_norms'].append(grad_norm)
+            
+            # Update best result
+            if current_fun < best_fun:
+                best_fun = current_fun
+                best_x = current_x.copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            self.logger.info(f"Iter {result.nit:03d} Obj: {current_fun:.6e} GradNorm: {grad_norm:.6e}")
+            
+            # Custom stopping condition
+            if tol is not None and current_fun < tol:
+                result.x = current_x
+                result.fun = current_fun
+                result.success = True
+                result.message = f"Objective < tolerance ({current_fun:.2e} < {tol:.2e})"
+                self.logger.info(f"Custom convergence achieved: {current_fun:.2e} < {tol:.2e}")
+                break
+            
+            # Gradient convergence check
+            if grad_norm < 1e-8:  # Gradient is sufficiently small
+                result.x = current_x
+                result.fun = current_fun
+                result.success = True
+                result.message = f"Gradient converged (norm: {grad_norm:.2e})"
+                self.logger.info(f"Gradient convergence achieved: {grad_norm:.2e}")
+                break
+            
+            # Early stopping condition
+            if patience_counter >= patience:
+                result.x = best_x
+                result.fun = best_fun
+                result.success = True
+                result.message = f"No improvement for {patience} iterations"
+                self.logger.info(f"Early stopping at iteration {iteration}")
+                break
+            
+            # User callback
+            if user_callback:
+                user_callback(result, current_x, current_fun)
+        
+        else:
+            # Reached maximum iterations
+            result.x = best_x
+            result.fun = best_fun
+            result.success = False
+            result.message = f"Maximum iterations reached ({max_iter})"
+            self.logger.warning("Maximum iterations reached without convergence")
+        
+        # Set final result
+        if result.success:
+            self.logger.info(f"Optimization completed successfully: {result.message}")
+        else:
+            self.logger.warning(f"Optimization did not converge: {result.message}")
+        
+        return result

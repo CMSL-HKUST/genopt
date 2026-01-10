@@ -1,1 +1,326 @@
-"""Plasticity (tailored stress-strain curve)"""import osimport pickleimport jaximport jax.numpy as npimport numpy as onpimport scipyimport matplotlib.pyplot as pltfrom jax_fem import logger as jax_fem_loggerjax_fem_logger.setLevel("INFO")from net.flax_diffusion import prep_samplerfrom fem.utils import generate_meshfrom fem.plasticity import prep_femfrom helper import loggerfrom helper.opt import Optimizerfrom helper.post import beige_to_black as custom_cmapjax.config.update("jax_enable_x64", True)# rng seedseed = 6# dir & pathwork_dir = f'../results/plasticity/seed_{seed}'os.makedirs(work_dir, exist_ok=True)#%% PREPARATIONrng_seed, sample_rng = jax.random.split(jax.random.PRNGKey(seed))sample_shape = (1, 32, 32, 1)# modelmesh = generate_mesh(domain_size=(1.,1.), mesh_size=(32, 32), ele_type="QUAD4")num_cells = len(mesh.cells)Ly = onp.max(mesh.points[:,1])full_disps = (onp.linspace(0, 0.01, 21) * Ly)disps = full_disps[1:]bounds = {'Emax': 100.e3, 'Emin': 1.e3, 'sig0_max': 300, 'sig0_min': 30}problem, fwd_pred_seq, fwd_pred = prep_fem(mesh, disps)problem.set_material_bounds(bounds)def forward_problem(samples_E, samples_sig0):    theta_E = samples_E[::-1,:].reshape((-1,1), order='F')    theta_sig0 = samples_sig0[::-1,:].reshape((-1,1), order='F')    thetas = np.hstack((theta_E, theta_sig0))    _, stresses = fwd_pred_seq(thetas)    return stresses# samplersampler = prep_sampler('MNIST', epoch=100, num_inference_steps=10, seed=seed)class Sampler:    def __init__(self, beta):        self.beta = beta        def __call__(self, params):        x_noise = params.reshape(sample_shape)        samples = sampler.sample(sample_rng,                                 x_noise)        samples = (np.tanh(self.beta * samples) + 1) / 2        samples = 1. - samples[0, :, :, 0]        return samplesbetas = [10, 20, 100]generate_samples = Sampler(beta=betas[-1])# samplesrng_seed, target_rng = jax.random.split(rng_seed)num_samples = (1000,)x_noise_ini_sets = jax.random.normal(target_rng, num_samples + sample_shape)# target datadef approx_fn(x, E, eps_y, sig_inf, As, betas):    elastic = E * x    sig_y = E * eps_y        betas = np.array(betas)    As = np.array(As)        A_last = sig_inf - sig_y - np.sum(As)    As_full = np.append(As, A_last)        plastic = sig_y    for i in range(len(betas)):        plastic += As_full[i] * (1 - np.exp(-betas[i] * (x - eps_y)))        return np.where(x <= eps_y, elastic, plastic)#%% Trial groups             trial_groups =(                [48000, 0.0027, 220, [4, 1], [1000, 88, 88]],                [68000, 0.0028, 250, [12, 1],[1000, 87, 87]],                [82000, 0.0028, 280, [18, 1],[1000, 63, 63]]                )# [82000, 0.0028, 280, [18, 1],[1000, 63, 63]]# [82000, 0.0028, 280, [16, 1],[1000, 75, 75]cid = 2stresses_target = approx_fn(full_disps, *(trial_groups[cid]))[1:]ids = [((79, 5), (73, 0)),]show_bounds = Falseplt.figure(figsize=(8, 8))if show_bounds:    for iE, iS in [(1,1),(0,0)]:        bound_stresses = forward_problem(iE * onp.ones(sample_shape),                                    iS * onp.ones(sample_shape))        plt.plot(full_disps, [0.]+bound_stresses.tolist(), marker='o',                  markersize=8, linestyle='-', label=f'E:{iE}, sig0:{iS}')for ind, trial_params in enumerate(trial_groups):    stresses = approx_fn(full_disps, *trial_params)    plt.plot(full_disps, stresses, ls='-', marker='s',              label='target' if ind==cid else f'trial_{ind}')plt.legend(fontsize=20)plt.xlabel(r'Displacement of top surface [mm]', fontsize=20)plt.ylabel(r'Volume averaged stress (y-y) [MPa]', fontsize=20)plt.tick_params(labelsize=18)plt.grid()plt.show()# lossnum_steps = len(stresses_target)def loss_fn(x):    noise_E = x[:num_cells].reshape(sample_shape, order='F')    noise_sig0 = x[num_cells:].reshape(sample_shape, order='F')    sample_E = generate_samples(noise_E)    sample_sig0 = generate_samples(noise_sig0)    stresses_seq = forward_problem(sample_E, sample_sig0)    loss = np.sum((stresses_seq - stresses_target)**2.)/num_steps    return loss#%% OPTIMIZATIONsave_dir = os.path.join(work_dir, 'E_sig0')os.makedirs(save_dir, exist_ok=True)for (ini_E, ini_sig0) in ids:    ini_id_E, ini_num_E = ini_E    ini_id_sig0, ini_num_sig0 = ini_sig0        save_file = f'plast_{cid}_E_{ini_id_E}_sig0_{ini_id_sig0}'    results_file = os.path.join(save_dir, f'{save_file}.pkl')        if not os.path.exists(results_file):                # logger        log_file = os.path.join(save_dir, f'{save_file}.log')        logger.update_config(log_file=log_file, level='INFO', output='a')                # initial         x_noise_ini_E = x_noise_ini_sets[ini_id_E,...]        sample_ini_E = generate_samples(x_noise_ini_E)                x_noise_ini_sig0 = x_noise_ini_sets[ini_id_sig0,...]        sample_ini_sig0 = generate_samples(x_noise_ini_sig0)                plt.subplot(1,2,1)        plt.imshow(sample_ini_E,cmap=custom_cmap)        plt.axis('off')        plt.subplot(1,2,2)        plt.imshow(sample_ini_sig0,cmap=custom_cmap)        plt.axis('off')        plt.show()                x_noise_ini = onp.concatenate((x_noise_ini_E.flatten(order='F'),                                        x_noise_ini_sig0.flatten(order='F')))                stresses_ini = forward_problem(sample_ini_E, sample_ini_sig0)            # curve        plt.figure(figsize=(4,4))        plt.plot(full_disps, [0.]+stresses_target.tolist(), label='target')        plt.plot(full_disps, [0.]+stresses_ini.tolist(), label='initial')        plt.legend()        plt.show()                # optimize        optimizer = optimizer = Optimizer(method='BFGS', backend='scipy', logger=logger)        maxits = len(betas) * [100]        results = []        x_tol = 1e-3        xiter = x_noise_ini.reshape(-1, order='F')        for beta, maxiter in zip(betas, maxits):            logger.info('=' * 60)            logger.info(f'Projection function slope: {beta}')            generate_samples.beta = beta            scipy_options = {'maxiter': maxiter, 'disp': False, 'ftol': 1e-20, 'gtol': 1e-20}            result = optimizer.minimize(objective=loss_fn,                                         x0=xiter,                                        tol = 0.5,                                        options=scipy_options)            results.append(result)            xiter = result.x                        # result            x_noise_opt_E = (results[-1].x[:num_cells]).reshape(sample_shape, order='F')            x_noise_opt_sig0 = (results[-1].x[num_cells:]).reshape(sample_shape, order='F')                        sample_opt_E = generate_samples(x_noise_opt_E)            sample_opt_sig0 = generate_samples(x_noise_opt_sig0)                        stresses_opt = forward_problem(sample_opt_E, sample_opt_sig0)                        plt.figure(figsize=(6, 4))            plt.subplot(2,3,1)            plt.imshow(x_noise_ini_E[0,:,:,0], cmap='gray')            plt.axis('off')            plt.subplot(2,3,2)            plt.imshow(x_noise_opt_E[0,:,:,0], cmap='gray')            plt.axis('off')            plt.subplot(2,3,3)            plt.imshow(sample_opt_E,cmap=custom_cmap)            plt.axis('off')            plt.subplot(2,3,4)            plt.imshow(x_noise_ini_sig0[0,:,:,0], cmap='gray')            plt.axis('off')            plt.subplot(2,3,5)            plt.imshow(x_noise_opt_sig0[0,:,:,0], cmap='gray')            plt.axis('off')            plt.subplot(2,3,6)            plt.imshow(sample_opt_sig0,cmap=custom_cmap)            plt.axis('off')            plt.show()                        plt.figure(figsize=(6, 6))            plt.plot(full_disps, [0.]+stresses_target.tolist(), 'r-', marker='o', label='Target')            plt.plot(full_disps, [0.]+stresses_ini.tolist(), 'g-', marker='o',label='Initial')            plt.plot(full_disps, [0.]+stresses_opt.tolist(), 'b--', marker='o',label='Optimized')            plt.title("Stress")            plt.legend(frameon=False)            plt.show()                        # gaussian            logger.info(f'Noise E means: {float(onp.mean(x_noise_opt_E)):.4e} stds: {float(onp.std(x_noise_opt_E)):.4e}')            logger.info(f'Noise sig0 means: {float(onp.mean(x_noise_opt_sig0)):.4e} stds: {float(onp.std(x_noise_opt_sig0)):.4e}')                        # 0-1            dense_ratio_E = onp.mean((sample_opt_E < x_tol) | (sample_opt_E > 1 - x_tol))            dense_ratio_sig0 = onp.mean((sample_opt_sig0 < x_tol) | (sample_opt_sig0 > 1 - x_tol))            logger.info(f'0-1 ratio - E: {dense_ratio_E}  sig0: {dense_ratio_sig0}')                            # save        data_ini = [x_noise_ini_E, sample_ini_E, x_noise_ini_sig0, sample_ini_sig0, stresses_ini]        data_opt = [x_noise_opt_E, sample_opt_E, x_noise_opt_sig0, sample_opt_sig0, stresses_opt]        with open(results_file, "wb") as f:            pickle.dump([results, stresses_target, data_ini, data_opt], f)            # Postprocessing    with open(results_file, "rb") as f:          results, stresses_target, data_ini, data_opt = pickle.load(f)              x_noise_ini_E, sample_ini_E, x_noise_ini_sig0, sample_ini_sig0, stresses_ini = data_ini    x_noise_opt_E, sample_opt_E, x_noise_opt_sig0, sample_opt_sig0, stresses_opt = data_opt            # loss    funs = results[-1].history["funs"]    plt.figure(figsize=(10, 8))    plt.plot(onp.arange(len(funs)), funs, linestyle='-', linewidth=2, color='black')    plt.xlabel(r"Optimization step", fontsize=20)    plt.ylabel(r"Objective value", fontsize=20)    plt.tick_params(labelsize=20)    plt.tick_params(labelsize=20)    plt.show()        # results - E    plt.figure(figsize=(8, 8))    plt.subplot(2, 2, 1)    plt.imshow(x_noise_ini_E[0,:,:,0], cmap='gray')    plt.title("Initial noise")    plt.axis('off')    plt.subplot(2, 2, 2)    plt.imshow(sample_ini_E, cmap=custom_cmap)    plt.title("Initial sample for E")    plt.axis('off')    plt.subplot(2, 2, 3)    plt.imshow(x_noise_opt_E[0,:,:,0], cmap='gray')    plt.title("Optimized noise")    plt.axis('off')    plt.subplot(2, 2, 4)    plt.imshow(sample_opt_E, cmap=custom_cmap)    plt.title("Optimized sample for E")    plt.axis('off')    plt.tight_layout()    plt.show()        # results - sig0    plt.figure(figsize=(8, 8))    plt.subplot(2, 2, 1)    plt.imshow(x_noise_ini_sig0[0,:,:,0], cmap='gray')    plt.title("Initial noise")    plt.axis('off')    plt.subplot(2, 2, 2)    plt.imshow(sample_ini_sig0, cmap=custom_cmap)    plt.title("Initial sample for sig0")    plt.axis('off')    plt.subplot(2, 2, 3)    plt.imshow(x_noise_opt_sig0[0,:,:,0], cmap='gray')    plt.title("Optimized noise")    plt.axis('off')    plt.subplot(2, 2, 4)    plt.imshow(sample_opt_sig0, cmap=custom_cmap)    plt.title("Optimized sample for sig0")    plt.axis('off')    plt.tight_layout()    plt.show()        # curve    plt.figure(figsize=(6, 6))    plt.plot(full_disps, [0.]+stresses_target.tolist(), 'r-', marker='o', label='Target')    plt.plot(full_disps, [0.]+stresses_ini.tolist(), 'g-', marker='o',label='Initial')    plt.plot(full_disps, [0.]+stresses_opt.tolist(), 'b--', marker='o',label='Optimized')    plt.title("Stress")    plt.legend(frameon=False)    plt.show()    
+"""
+
+Plasticity (tailored stress-strain curve)
+
+"""
+
+import os
+import pickle
+
+import jax
+import jax.numpy as np
+
+import numpy as onp
+import scipy
+import matplotlib.pyplot as plt
+
+from jax_fem import logger as jax_fem_logger
+jax_fem_logger.setLevel("INFO")
+
+from net.flax_diffusion import prep_sampler
+
+from fem.utils import generate_mesh
+from fem.plasticity import prep_fem
+
+from helper import logger
+from helper.opt import Optimizer
+from helper.post import beige_to_black as custom_cmap
+
+jax.config.update("jax_enable_x64", True)
+
+# rng seed
+seed = 6
+
+# dir & path
+work_dir = f'../results/plasticity/seed_{seed}'
+os.makedirs(work_dir, exist_ok=True)
+
+#%% PREPARATION
+rng_seed, sample_rng = jax.random.split(jax.random.PRNGKey(seed))
+sample_shape = (1, 32, 32, 1)
+
+# model
+mesh = generate_mesh(domain_size=(1.,1.), mesh_size=(32, 32), ele_type="QUAD4")
+num_cells = len(mesh.cells)
+Ly = onp.max(mesh.points[:,1])
+full_disps = (onp.linspace(0, 0.01, 21) * Ly)
+disps = full_disps[1:]
+bounds = {'Emax': 100.e3, 'Emin': 1.e3, 'sig0_max': 300, 'sig0_min': 30}
+problem, fwd_pred_seq, fwd_pred = prep_fem(mesh, disps)
+problem.set_material_bounds(bounds)
+
+def forward_problem(samples_E, samples_sig0):
+    theta_E = samples_E[::-1,:].reshape((-1,1), order='F')
+    theta_sig0 = samples_sig0[::-1,:].reshape((-1,1), order='F')
+    thetas = np.hstack((theta_E, theta_sig0))
+    _, stresses = fwd_pred_seq(thetas)
+    return stresses
+
+# sampler
+sampler = prep_sampler('MNIST', epoch=100, num_inference_steps=10, seed=seed)
+class Sampler:
+    def __init__(self, beta):
+        self.beta = beta
+    
+    def __call__(self, params):
+        x_noise = params.reshape(sample_shape)
+        samples = sampler.sample(sample_rng,
+                                 x_noise)
+        samples = (np.tanh(self.beta * samples) + 1) / 2
+        samples = 1. - samples[0, :, :, 0]
+        return samples
+
+betas = [10, 20, 100]
+generate_samples = Sampler(beta=betas[-1])
+
+# samples
+rng_seed, target_rng = jax.random.split(rng_seed)
+num_samples = (1000,)
+x_noise_ini_sets = jax.random.normal(target_rng, num_samples + sample_shape)
+
+# target data
+def approx_fn(x, E, eps_y, sig_inf, As, betas):
+    elastic = E * x
+    sig_y = E * eps_y
+    
+    betas = np.array(betas)
+    As = np.array(As)
+    
+    A_last = sig_inf - sig_y - np.sum(As)
+    As_full = np.append(As, A_last)
+    
+    plastic = sig_y
+    for i in range(len(betas)):
+        plastic += As_full[i] * (1 - np.exp(-betas[i] * (x - eps_y)))
+    
+    return np.where(x <= eps_y, elastic, plastic)
+
+
+#%% Trial groups             
+trial_groups =(
+                [48000, 0.0027, 220, [4, 1], [1000, 88, 88]],
+                [68000, 0.0028, 250, [12, 1],[1000, 87, 87]],
+                [82000, 0.0028, 280, [18, 1],[1000, 63, 63]]
+                )
+# [82000, 0.0028, 280, [18, 1],[1000, 63, 63]]
+# [82000, 0.0028, 280, [16, 1],[1000, 75, 75]
+cid = 2
+stresses_target = approx_fn(full_disps, *(trial_groups[cid]))[1:]
+ids = [((79, 5), (73, 0)),]
+
+show_bounds = False
+plt.figure(figsize=(8, 8))
+if show_bounds:
+    for iE, iS in [(1,1),(0,0)]:
+        bound_stresses = forward_problem(iE * onp.ones(sample_shape), 
+                                   iS * onp.ones(sample_shape))
+        plt.plot(full_disps, [0.]+bound_stresses.tolist(), marker='o', 
+                 markersize=8, linestyle='-', label=f'E:{iE}, sig0:{iS}')
+for ind, trial_params in enumerate(trial_groups):
+    stresses = approx_fn(full_disps, *trial_params)
+    plt.plot(full_disps, stresses, ls='-', marker='s', 
+             label='target' if ind==cid else f'trial_{ind}')
+plt.legend(fontsize=20)
+plt.xlabel(r'Displacement of top surface [mm]', fontsize=20)
+plt.ylabel(r'Volume averaged stress (y-y) [MPa]', fontsize=20)
+plt.tick_params(labelsize=18)
+plt.grid()
+plt.show()
+
+# loss
+num_steps = len(stresses_target)
+def loss_fn(x):
+    noise_E = x[:num_cells].reshape(sample_shape, order='F')
+    noise_sig0 = x[num_cells:].reshape(sample_shape, order='F')
+    sample_E = generate_samples(noise_E)
+    sample_sig0 = generate_samples(noise_sig0)
+    stresses_seq = forward_problem(sample_E, sample_sig0)
+    loss = np.sum((stresses_seq - stresses_target)**2.)/num_steps
+    return loss
+
+#%% OPTIMIZATION
+save_dir = os.path.join(work_dir, 'E_sig0')
+os.makedirs(save_dir, exist_ok=True)
+for (ini_E, ini_sig0) in ids:
+
+    ini_id_E, ini_num_E = ini_E
+    ini_id_sig0, ini_num_sig0 = ini_sig0
+    
+    save_file = f'plast_{cid}_E_{ini_id_E}_sig0_{ini_id_sig0}'
+    results_file = os.path.join(save_dir, f'{save_file}.pkl')
+    
+    if not os.path.exists(results_file):
+        
+        # logger
+        log_file = os.path.join(save_dir, f'{save_file}.log')
+        logger.update_config(log_file=log_file, level='INFO', output='a')
+        
+        # initial 
+        x_noise_ini_E = x_noise_ini_sets[ini_id_E,...]
+        sample_ini_E = generate_samples(x_noise_ini_E)
+        
+        x_noise_ini_sig0 = x_noise_ini_sets[ini_id_sig0,...]
+        sample_ini_sig0 = generate_samples(x_noise_ini_sig0)
+        
+        plt.subplot(1,2,1)
+        plt.imshow(sample_ini_E,cmap=custom_cmap)
+        plt.axis('off')
+        plt.subplot(1,2,2)
+        plt.imshow(sample_ini_sig0,cmap=custom_cmap)
+        plt.axis('off')
+        plt.show()
+        
+        x_noise_ini = onp.concatenate((x_noise_ini_E.flatten(order='F'), 
+                                       x_noise_ini_sig0.flatten(order='F')))
+        
+        stresses_ini = forward_problem(sample_ini_E, sample_ini_sig0)
+    
+        # curve
+        plt.figure(figsize=(4,4))
+        plt.plot(full_disps, [0.]+stresses_target.tolist(), label='target')
+        plt.plot(full_disps, [0.]+stresses_ini.tolist(), label='initial')
+        plt.legend()
+        plt.show()
+        
+        # optimize
+        optimizer = optimizer = Optimizer(method='BFGS', backend='scipy', logger=logger)
+        maxits = len(betas) * [100]
+        results = []
+        x_tol = 1e-3
+        xiter = x_noise_ini.reshape(-1, order='F')
+        for beta, maxiter in zip(betas, maxits):
+            logger.info('=' * 60)
+            logger.info(f'Projection function slope: {beta}')
+            generate_samples.beta = beta
+            scipy_options = {'maxiter': maxiter, 'disp': False, 'ftol': 1e-20, 'gtol': 1e-20}
+            result = optimizer.minimize(objective=loss_fn, 
+                                        x0=xiter,
+                                        tol = 0.5,
+                                        options=scipy_options)
+            results.append(result)
+            xiter = result.x
+            
+            # result
+            x_noise_opt_E = (results[-1].x[:num_cells]).reshape(sample_shape, order='F')
+            x_noise_opt_sig0 = (results[-1].x[num_cells:]).reshape(sample_shape, order='F')
+            
+            sample_opt_E = generate_samples(x_noise_opt_E)
+            sample_opt_sig0 = generate_samples(x_noise_opt_sig0)
+            
+            stresses_opt = forward_problem(sample_opt_E, sample_opt_sig0)
+            
+            plt.figure(figsize=(6, 4))
+            plt.subplot(2,3,1)
+            plt.imshow(x_noise_ini_E[0,:,:,0], cmap='gray')
+            plt.axis('off')
+            plt.subplot(2,3,2)
+            plt.imshow(x_noise_opt_E[0,:,:,0], cmap='gray')
+            plt.axis('off')
+            plt.subplot(2,3,3)
+            plt.imshow(sample_opt_E,cmap=custom_cmap)
+            plt.axis('off')
+            plt.subplot(2,3,4)
+            plt.imshow(x_noise_ini_sig0[0,:,:,0], cmap='gray')
+            plt.axis('off')
+            plt.subplot(2,3,5)
+            plt.imshow(x_noise_opt_sig0[0,:,:,0], cmap='gray')
+            plt.axis('off')
+            plt.subplot(2,3,6)
+            plt.imshow(sample_opt_sig0,cmap=custom_cmap)
+            plt.axis('off')
+            plt.show()
+            
+            plt.figure(figsize=(6, 6))
+            plt.plot(full_disps, [0.]+stresses_target.tolist(), 'r-', marker='o', label='Target')
+            plt.plot(full_disps, [0.]+stresses_ini.tolist(), 'g-', marker='o',label='Initial')
+            plt.plot(full_disps, [0.]+stresses_opt.tolist(), 'b--', marker='o',label='Optimized')
+            plt.title("Stress")
+            plt.legend(frameon=False)
+            plt.show()
+            
+            # gaussian
+            logger.info(f'Noise E means: {float(onp.mean(x_noise_opt_E)):.4e} stds: {float(onp.std(x_noise_opt_E)):.4e}')
+            logger.info(f'Noise sig0 means: {float(onp.mean(x_noise_opt_sig0)):.4e} stds: {float(onp.std(x_noise_opt_sig0)):.4e}')
+            
+            # 0-1
+            dense_ratio_E = onp.mean((sample_opt_E < x_tol) | (sample_opt_E > 1 - x_tol))
+            dense_ratio_sig0 = onp.mean((sample_opt_sig0 < x_tol) | (sample_opt_sig0 > 1 - x_tol))
+            logger.info(f'0-1 ratio - E: {dense_ratio_E}  sig0: {dense_ratio_sig0}')
+            
+
+        
+        # save
+        data_ini = [x_noise_ini_E, sample_ini_E, x_noise_ini_sig0, sample_ini_sig0, stresses_ini]
+        data_opt = [x_noise_opt_E, sample_opt_E, x_noise_opt_sig0, sample_opt_sig0, stresses_opt]
+        with open(results_file, "wb") as f:
+            pickle.dump([results, stresses_target, data_ini, data_opt], f)
+    
+    
+    # Postprocessing
+    with open(results_file, "rb") as f:  
+        results, stresses_target, data_ini, data_opt = pickle.load(f)  
+        
+    x_noise_ini_E, sample_ini_E, x_noise_ini_sig0, sample_ini_sig0, stresses_ini = data_ini
+    x_noise_opt_E, sample_opt_E, x_noise_opt_sig0, sample_opt_sig0, stresses_opt = data_opt
+        
+    # loss
+    funs = results[-1].history["funs"]
+    plt.figure(figsize=(10, 8))
+    plt.plot(onp.arange(len(funs)), funs, linestyle='-', linewidth=2, color='black')
+    plt.xlabel(r"Optimization step", fontsize=20)
+    plt.ylabel(r"Objective value", fontsize=20)
+    plt.tick_params(labelsize=20)
+    plt.tick_params(labelsize=20)
+    plt.show()
+    
+    # results - E
+    plt.figure(figsize=(8, 8))
+    plt.subplot(2, 2, 1)
+    plt.imshow(x_noise_ini_E[0,:,:,0], cmap='gray')
+    plt.title("Initial noise")
+    plt.axis('off')
+    plt.subplot(2, 2, 2)
+    plt.imshow(sample_ini_E, cmap=custom_cmap)
+    plt.title("Initial sample for E")
+    plt.axis('off')
+    plt.subplot(2, 2, 3)
+    plt.imshow(x_noise_opt_E[0,:,:,0], cmap='gray')
+    plt.title("Optimized noise")
+    plt.axis('off')
+    plt.subplot(2, 2, 4)
+    plt.imshow(sample_opt_E, cmap=custom_cmap)
+    plt.title("Optimized sample for E")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # results - sig0
+    plt.figure(figsize=(8, 8))
+    plt.subplot(2, 2, 1)
+    plt.imshow(x_noise_ini_sig0[0,:,:,0], cmap='gray')
+    plt.title("Initial noise")
+    plt.axis('off')
+    plt.subplot(2, 2, 2)
+    plt.imshow(sample_ini_sig0, cmap=custom_cmap)
+    plt.title("Initial sample for sig0")
+    plt.axis('off')
+    plt.subplot(2, 2, 3)
+    plt.imshow(x_noise_opt_sig0[0,:,:,0], cmap='gray')
+    plt.title("Optimized noise")
+    plt.axis('off')
+    plt.subplot(2, 2, 4)
+    plt.imshow(sample_opt_sig0, cmap=custom_cmap)
+    plt.title("Optimized sample for sig0")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # curve
+    plt.figure(figsize=(6, 6))
+    plt.plot(full_disps, [0.]+stresses_target.tolist(), 'r-', marker='o', label='Target')
+    plt.plot(full_disps, [0.]+stresses_ini.tolist(), 'g-', marker='o',label='Initial')
+    plt.plot(full_disps, [0.]+stresses_opt.tolist(), 'b--', marker='o',label='Optimized')
+    plt.title("Stress")
+    plt.legend(frameon=False)
+    plt.show()
+    
