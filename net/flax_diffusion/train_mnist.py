@@ -1,1 +1,56 @@
-import osos.environ["CUDA_VISIBLE_DEVICES"] = "1" import tensorflow as tf# Disable GPU for TensorFlowtf.random.set_seed(42)tf.config.experimental.set_visible_devices([], 'GPU')import tensorflow_datasets as tfdstry:    from .training import trainexcept:    from training import train    # HyperparametersCONFIG = {    'data_size':60000,    'num_epochs': 100,    'batch_size': 128,    'learning_rate': 2e-4,    'timesteps': 1000,    'beta_start': 0.0001,    'beta_end': 0.02,    'image_size': 32,    'channels': 1,    'model_dir':os.path.join(os.path.dirname(__file__),                              'data', 'model', 'MNIST')    }# datasetdef get_dataset():    """Load and preprocess MNIST dataset"""        def preprocess(image, label):        # Normalize to [-1, 1]        image = tf.cast(image, tf.float32) / 127.5 - 1.0        # Resize to 32x32        image = tf.image.resize(image, (CONFIG['image_size'], CONFIG['image_size']))        return image        # Load dataset    ds, ds_info = tfds.load('mnist', split='train', as_supervised=True, with_info=True)    data_size = ds_info.splits['train'].num_examples    assert data_size == CONFIG['data_size']        ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)    ds = ds.cache()     ds = ds.shuffle(10000, seed=42, reshuffle_each_iteration=True)    ds = ds.batch(CONFIG['batch_size'], drop_remainder=True)    ds = ds.prefetch(tf.data.AUTOTUNE)        return dsif __name__ == '__main__':    ds = get_dataset()    train(ds, CONFIG)
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" 
+
+import tensorflow as tf
+# Disable GPU for TensorFlow
+tf.random.set_seed(42)
+tf.config.experimental.set_visible_devices([], 'GPU')
+import tensorflow_datasets as tfds
+
+try:
+    from .training import train
+except:
+    from training import train
+    
+# Hyperparameters
+CONFIG = {
+    'data_size':60000,
+    'num_epochs': 100,
+    'batch_size': 128,
+    'learning_rate': 2e-4,
+    'timesteps': 1000,
+    'beta_start': 0.0001,
+    'beta_end': 0.02,
+    'image_size': 32,
+    'channels': 1,
+    'model_dir':os.path.join(os.path.dirname(__file__), 
+                             'data', 'model', 'MNIST')
+    }
+
+# dataset
+def get_dataset():
+    """Load and preprocess MNIST dataset"""
+    
+    def preprocess(image, label):
+        # Normalize to [-1, 1]
+        image = tf.cast(image, tf.float32) / 127.5 - 1.0
+        # Resize to 32x32
+        image = tf.image.resize(image, (CONFIG['image_size'], CONFIG['image_size']))
+        return image
+    
+    # Load dataset
+    ds, ds_info = tfds.load('mnist', split='train', as_supervised=True, with_info=True)
+    data_size = ds_info.splits['train'].num_examples
+    assert data_size == CONFIG['data_size']
+    
+    ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.cache() 
+    ds = ds.shuffle(10000, seed=42, reshuffle_each_iteration=True)
+    ds = ds.batch(CONFIG['batch_size'], drop_remainder=True)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    
+    return ds
+
+if __name__ == '__main__':
+    ds = get_dataset()
+    train(ds, CONFIG)

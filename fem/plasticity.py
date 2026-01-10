@@ -1,1 +1,182 @@
-import numpy as onpimport jaximport jax.numpy as npfrom jax_fem import loggerfrom jax_fem.problem import Problemfrom jax_fem.solver import ad_wrapperclass Plasticity(Problem):    def custom_init(self):        self.fe = self.fes[0]        self.fe.flex_inds = np.arange(len(self.fe.cells))            def set_material_bounds(self, bounds):        self.Emax, self.Emin = bounds['Emax'], bounds['Emin']        self.sig0_max, self.sig0_min = bounds['sig0_max'], bounds['sig0_min']    def get_tensor_map(self):        _, stress_return_map, _ = self.get_maps()        return stress_return_map    def get_maps(self):        def safe_sqrt(x):              safe_x = np.where(x > 0., np.sqrt(x), 0.)            return safe_x        def safe_divide(x, y):            return np.where(y == 0., 0., x/y)        def strain(u_grad):            epsilon = 0.5*(u_grad + u_grad.T)            return epsilon        def stress(epsilon, E):            nu = 0.3            mu = E/(2.*(1. + nu))            lmbda = E*nu/((1+nu)*(1-2*nu))            sigma = lmbda*np.trace(epsilon)*np.eye(self.dim) + 2*mu*epsilon            return sigma        def stress_return_map_helper(u_grad, sigma_old, epsilon_old, f_yield_old, theta):                        theta1, theta2 = theta                        penal = 1.                        E = self.Emin + (self.Emax - self.Emin)*theta1**penal                        sig0 = self.sig0_min + (self.sig0_max - self.sig0_min)*theta2**penal                        epsilon_crt = strain(u_grad)            epsilon_inc = epsilon_crt - epsilon_old            sigma_trial = stress(epsilon_inc, E) + sigma_old            s_dev = sigma_trial - 1./self.dim*np.trace(sigma_trial)*np.eye(self.dim)            s_norm = safe_sqrt(3./2.*np.sum(s_dev*s_dev))            f_yield = s_norm - sig0            f_yield_plus = np.where(f_yield > 0., f_yield, 0.)            sigma = sigma_trial - safe_divide(f_yield_plus*s_dev, s_norm)            return sigma, f_yield        def stress_return_map(*args):            return stress_return_map_helper(*args)[0]        def f_yield_fn(*args):            return stress_return_map_helper(*args)[1]        return strain, stress_return_map, f_yield_fn    def stress_strain_fns(self):        strain, stress_return_map, f_yield_fn = self.get_maps()        vmap_strain = jax.vmap(jax.vmap(strain))        vmap_stress_return_map = jax.vmap(jax.vmap(stress_return_map))        vmap_f_yield_fn = jax.vmap(jax.vmap(f_yield_fn))        return vmap_strain, vmap_stress_return_map, vmap_f_yield_fn    def update_stress_strain(self, sol, params):        # (num_cells, 1, num_nodes, vec, 1) * (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, vec, dim)         u_grads = np.take(sol, self.fe.cells, axis=0)[:, None, :, :, None] * self.fe.shape_grads[:, :, :, None, :]         u_grads = np.sum(u_grads, axis=2) # (num_cells, num_quads, vec, dim)        vmap_strain, vmap_stress_rm, vmap_f_yield_fn = self.stress_strain_fns()        sigmas_old, epsilons_old, f_yield_old,  thetas = params        sigmas_update = vmap_stress_rm(u_grads, sigmas_old, epsilons_old, f_yield_old, thetas)        epsilons_update = vmap_strain(u_grads)        f_yield_update = vmap_f_yield_fn(u_grads, sigmas_old, epsilons_old, f_yield_old, thetas)        return sigmas_update, epsilons_update, f_yield_update, thetas    def set_params(self, params):        self.internal_vars = params    def init_params(self, theta):        epsilons_old = onp.zeros((len(self.fe.cells), self.fe.num_quads, self.fe.vec, self.dim))        sigmas_old = onp.zeros_like(epsilons_old)        f_yield_old = onp.zeros((len(self.fe.cells), self.fe.num_quads))        full_params = np.ones((self.num_cells, theta.shape[1]))        full_params = full_params.at[self.fe.flex_inds].set(theta)        thetas = np.repeat(full_params[:, None, :], self.fe.num_quads, axis=1)        self.full_params = full_params        return sigmas_old, epsilons_old, f_yield_old, thetas        def compute_avg_stress(self, sigmas_old):        # For post-processing only: Compute volume averaged stress.        # (num_cells*num_quads, vec, dim) * (num_cells*num_quads, 1, 1) -> (vec, dim)        sigma = np.sum(sigmas_old.reshape(-1, self.fe.vec, self.dim) * self.fe.JxW.reshape(-1)[:, None, None], 0)        vol = np.sum(self.fe.JxW)        avg_sigma = sigma/vol        return avg_sigmadef prep_fem(mesh, disps):    Ly = mesh.points[:,1].max()        # BCs (Dirichlet)    def top(point):        return np.isclose(point[1], Ly, atol=1e-5)        def bottom(point):        return np.isclose(point[1], 0., atol=1e-5)        def bottom_left_corner(point):        return np.isclose(point[0], 0., atol=1e-5) & np.isclose(point[1], 0., atol=1e-5)    def zero_dirichlet_val(point):        return 0.        def get_dirichlet_top(disp):        def val_fn(point):            return disp        return val_fn    location_fns = [bottom_left_corner, bottom, top]    value_fns = [zero_dirichlet_val, zero_dirichlet_val, get_dirichlet_top(disps[0])]    vecs = [0, 1, 1]    dirichlet_bc_info = [location_fns, vecs, value_fns]        # Problem    problem = Plasticity(mesh,                          vec=2,                          dim=2,                          ele_type="QUAD4",                          dirichlet_bc_info=dirichlet_bc_info)        fwd_pred = ad_wrapper(problem, solver_options={'umfpack_solver': {}, 'line_search_flag': True},                                    adjoint_solver_options={'umfpack_solver': {}})     def fwd_pred_seq(xs):                body_params = problem.init_params(xs)        # sol_list = [np.ones((problem.fe.num_total_nodes, problem.fe.vec))]        sol_lists = []        avg_stresses = []                for i, disp in enumerate(disps):                        logger.debug(f"Step {i} in {len(disps)}, disp = {disp}")                        # update Dirichlet BCs            dirichlet_bc_info[-1][-1] = get_dirichlet_top(disp)            problem.fe.update_Dirichlet_boundary_conditions(dirichlet_bc_info)                        # fwd_options['initial_guess'] = sol_list[0]                        # forward prediction            sol_list = fwd_pred(body_params) # [(num_nodes, num_vec)]                        body_params = problem.update_stress_strain(sol_list[0], body_params)                        sol_lists.append(sol_list[0])                        avg_stress = problem.compute_avg_stress(body_params[0])            avg_stresses.append(avg_stress[1,1])                        logger.debug(f"{avg_stress}")                logger.info("Finish forward predictions!")                return sol_lists, np.array(avg_stresses)        return problem, fwd_pred_seq, fwd_pred
+import numpy as onp
+import jax
+import jax.numpy as np
+
+from jax_fem import logger
+from jax_fem.problem import Problem
+from jax_fem.solver import ad_wrapper
+
+
+class Plasticity(Problem):
+    def custom_init(self):
+        self.fe = self.fes[0]
+        self.fe.flex_inds = np.arange(len(self.fe.cells))
+        
+    def set_material_bounds(self, bounds):
+        self.Emax, self.Emin = bounds['Emax'], bounds['Emin']
+        self.sig0_max, self.sig0_min = bounds['sig0_max'], bounds['sig0_min']
+
+    def get_tensor_map(self):
+        _, stress_return_map, _ = self.get_maps()
+        return stress_return_map
+
+    def get_maps(self):
+        def safe_sqrt(x):  
+            safe_x = np.where(x > 0., np.sqrt(x), 0.)
+            return safe_x
+
+        def safe_divide(x, y):
+            return np.where(y == 0., 0., x/y)
+
+        def strain(u_grad):
+            epsilon = 0.5*(u_grad + u_grad.T)
+            return epsilon
+
+        def stress(epsilon, E):
+            nu = 0.3
+            mu = E/(2.*(1. + nu))
+            lmbda = E*nu/((1+nu)*(1-2*nu))
+            sigma = lmbda*np.trace(epsilon)*np.eye(self.dim) + 2*mu*epsilon
+            return sigma
+
+        def stress_return_map_helper(u_grad, sigma_old, epsilon_old, f_yield_old, theta):
+            
+            theta1, theta2 = theta
+            
+            penal = 1.
+            
+            E = self.Emin + (self.Emax - self.Emin)*theta1**penal
+            
+            sig0 = self.sig0_min + (self.sig0_max - self.sig0_min)*theta2**penal
+            
+            epsilon_crt = strain(u_grad)
+            epsilon_inc = epsilon_crt - epsilon_old
+            sigma_trial = stress(epsilon_inc, E) + sigma_old
+            s_dev = sigma_trial - 1./self.dim*np.trace(sigma_trial)*np.eye(self.dim)
+            s_norm = safe_sqrt(3./2.*np.sum(s_dev*s_dev))
+            f_yield = s_norm - sig0
+            f_yield_plus = np.where(f_yield > 0., f_yield, 0.)
+            sigma = sigma_trial - safe_divide(f_yield_plus*s_dev, s_norm)
+            return sigma, f_yield
+
+        def stress_return_map(*args):
+            return stress_return_map_helper(*args)[0]
+
+        def f_yield_fn(*args):
+            return stress_return_map_helper(*args)[1]
+
+        return strain, stress_return_map, f_yield_fn
+
+    def stress_strain_fns(self):
+        strain, stress_return_map, f_yield_fn = self.get_maps()
+        vmap_strain = jax.vmap(jax.vmap(strain))
+        vmap_stress_return_map = jax.vmap(jax.vmap(stress_return_map))
+        vmap_f_yield_fn = jax.vmap(jax.vmap(f_yield_fn))
+        return vmap_strain, vmap_stress_return_map, vmap_f_yield_fn
+
+    def update_stress_strain(self, sol, params):
+        # (num_cells, 1, num_nodes, vec, 1) * (num_cells, num_quads, num_nodes, 1, dim) -> (num_cells, num_quads, num_nodes, vec, dim) 
+        u_grads = np.take(sol, self.fe.cells, axis=0)[:, None, :, :, None] * self.fe.shape_grads[:, :, :, None, :] 
+        u_grads = np.sum(u_grads, axis=2) # (num_cells, num_quads, vec, dim)
+        vmap_strain, vmap_stress_rm, vmap_f_yield_fn = self.stress_strain_fns()
+        sigmas_old, epsilons_old, f_yield_old,  thetas = params
+        sigmas_update = vmap_stress_rm(u_grads, sigmas_old, epsilons_old, f_yield_old, thetas)
+        epsilons_update = vmap_strain(u_grads)
+        f_yield_update = vmap_f_yield_fn(u_grads, sigmas_old, epsilons_old, f_yield_old, thetas)
+        return sigmas_update, epsilons_update, f_yield_update, thetas
+
+    def set_params(self, params):
+        self.internal_vars = params
+
+    def init_params(self, theta):
+        epsilons_old = onp.zeros((len(self.fe.cells), self.fe.num_quads, self.fe.vec, self.dim))
+        sigmas_old = onp.zeros_like(epsilons_old)
+        f_yield_old = onp.zeros((len(self.fe.cells), self.fe.num_quads))
+        full_params = np.ones((self.num_cells, theta.shape[1]))
+        full_params = full_params.at[self.fe.flex_inds].set(theta)
+        thetas = np.repeat(full_params[:, None, :], self.fe.num_quads, axis=1)
+        self.full_params = full_params
+        return sigmas_old, epsilons_old, f_yield_old, thetas
+    
+    def compute_avg_stress(self, sigmas_old):
+        # For post-processing only: Compute volume averaged stress.
+        # (num_cells*num_quads, vec, dim) * (num_cells*num_quads, 1, 1) -> (vec, dim)
+        sigma = np.sum(sigmas_old.reshape(-1, self.fe.vec, self.dim) * self.fe.JxW.reshape(-1)[:, None, None], 0)
+        vol = np.sum(self.fe.JxW)
+        avg_sigma = sigma/vol
+        return avg_sigma
+
+
+def prep_fem(mesh, disps):
+
+    Ly = mesh.points[:,1].max()
+    
+    # BCs (Dirichlet)
+    def top(point):
+        return np.isclose(point[1], Ly, atol=1e-5)
+    
+    def bottom(point):
+        return np.isclose(point[1], 0., atol=1e-5)
+    
+    def bottom_left_corner(point):
+        return np.isclose(point[0], 0., atol=1e-5) & np.isclose(point[1], 0., atol=1e-5)
+
+    def zero_dirichlet_val(point):
+        return 0.
+    
+    def get_dirichlet_top(disp):
+        def val_fn(point):
+            return disp
+        return val_fn
+
+    location_fns = [bottom_left_corner, bottom, top]
+    value_fns = [zero_dirichlet_val, zero_dirichlet_val, get_dirichlet_top(disps[0])]
+    vecs = [0, 1, 1]
+    dirichlet_bc_info = [location_fns, vecs, value_fns]
+    
+    # Problem
+    problem = Plasticity(mesh, 
+                         vec=2, 
+                         dim=2, 
+                         ele_type="QUAD4", 
+                         dirichlet_bc_info=dirichlet_bc_info)
+    
+    fwd_pred = ad_wrapper(problem, solver_options={'umfpack_solver': {}, 'line_search_flag': True}, 
+                                   adjoint_solver_options={'umfpack_solver': {}})
+ 
+    def fwd_pred_seq(xs):
+        
+        body_params = problem.init_params(xs)
+
+        # sol_list = [np.ones((problem.fe.num_total_nodes, problem.fe.vec))]
+
+        sol_lists = []
+        avg_stresses = []
+        
+        for i, disp in enumerate(disps):
+            
+            logger.debug(f"Step {i} in {len(disps)}, disp = {disp}")
+            
+            # update Dirichlet BCs
+            dirichlet_bc_info[-1][-1] = get_dirichlet_top(disp)
+            problem.fe.update_Dirichlet_boundary_conditions(dirichlet_bc_info)
+            
+            # fwd_options['initial_guess'] = sol_list[0]
+            
+            # forward prediction
+            sol_list = fwd_pred(body_params) # [(num_nodes, num_vec)]
+            
+            body_params = problem.update_stress_strain(sol_list[0], body_params)
+            
+            sol_lists.append(sol_list[0])
+            
+            avg_stress = problem.compute_avg_stress(body_params[0])
+            avg_stresses.append(avg_stress[1,1])
+            
+            logger.debug(f"{avg_stress}")
+        
+        logger.info("Finish forward predictions!")
+        
+        return sol_lists, np.array(avg_stresses)
+    
+    return problem, fwd_pred_seq, fwd_pred
