@@ -44,7 +44,16 @@ python ddpm_gaussian.py
 ## Citation
 If you find this code useful for your research, please consider citing our paper:
 ```bibtex
-to be added
+@article{xu2026style,
+  title={Style-Constrained Inverse Design of Microstructures With Tailored Mechanical Properties Using Unconditional Diffusion Models},
+  author={Xu, Weipeng and Xie, Ziyuan and Lin, Haoju and Wang, Xinyu and Mou, Guangjin and Xue, Tianju},
+  journal={International Journal for Numerical Methods in Engineering},
+  volume={127},
+  number={13},
+  pages={e70376},
+  year={2026},
+  publisher={Wiley Online Library}
+}
 ```
 
 
